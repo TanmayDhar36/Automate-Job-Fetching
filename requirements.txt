@@ -1,0 +1,6 @@
+streamlit
+reportlab
+beautifulsoup4
+selenium
+webdriver-manager
+requests
