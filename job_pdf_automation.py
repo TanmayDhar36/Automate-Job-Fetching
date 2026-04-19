@@ -21,13 +21,17 @@ from __future__ import annotations
 import argparse
 import re
 import shutil
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Callable, Iterable, List
 from urllib.parse import quote_plus, urljoin
 
 import requests
+from requests.adapters import HTTPAdapter
 
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -58,6 +62,19 @@ ROLE_QUERIES = [
 LOCATION_QUERIES = ["India", "Bangalore, India", "Kolkata, India", "Remote India"]
 EXPERIENCE_LEVELS = ["Fresher", "0 to 2 years", "More experience"]
 ALL_ROLES_OPTION = "All roles"
+_THREAD_LOCAL = threading.local()
+
+
+def _get_requests_session() -> requests.Session:
+    """Return a per-thread Session to reuse TCP connections across requests."""
+    session = getattr(_THREAD_LOCAL, "requests_session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(pool_connections=64, pool_maxsize=64)
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _THREAD_LOCAL.requests_session = session
+    return session
 
 
 def collect_mock_job_listings() -> List[JobListing]:
@@ -279,7 +296,7 @@ def fetch_remotive_jobs(role_query: str, timeout_seconds: int = 20) -> List[JobL
     jobs: List[JobListing] = []
     url = f"https://remotive.com/api/remote-jobs?search={quote_plus(role_query)}"
 
-    response = requests.get(url, timeout=timeout_seconds)
+    response = _get_requests_session().get(url, timeout=timeout_seconds)
     response.raise_for_status()
     payload = response.json()
 
@@ -304,14 +321,19 @@ def fetch_remotive_jobs(role_query: str, timeout_seconds: int = 20) -> List[JobL
     return jobs
 
 
+@lru_cache(maxsize=8)
+def _fetch_arbeitnow_payload(timeout_seconds: int = 20) -> dict:
+    """Fetch Arbeitnow payload once per timeout value and reuse for role filters."""
+    url = "https://www.arbeitnow.com/api/job-board-api"
+    response = _get_requests_session().get(url, timeout=timeout_seconds)
+    response.raise_for_status()
+    return response.json()
+
+
 def fetch_arbeitnow_jobs(role_query: str, timeout_seconds: int = 20) -> List[JobListing]:
     """Fetch jobs from the public Arbeitnow API."""
     jobs: List[JobListing] = []
-    url = "https://www.arbeitnow.com/api/job-board-api"
-
-    response = requests.get(url, timeout=timeout_seconds)
-    response.raise_for_status()
-    payload = response.json()
+    payload = _fetch_arbeitnow_payload(timeout_seconds=timeout_seconds)
 
     query_lower = role_query.lower()
 
@@ -486,8 +508,10 @@ def _deduplicate_jobs(listings: Iterable[JobListing]) -> List[JobListing]:
 def collect_live_job_listings(
     role_queries: List[str] | None = None,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    max_api_workers: int = 6,
+    max_browser_workers: int = 3,
 ) -> List[JobListing]:
-    """Collect live jobs from Naukri, LinkedIn, and Indeed across role/location combinations."""
+    """Collect live jobs from all configured sources using bounded parallel workers."""
     all_jobs: List[JobListing] = []
     active_role_queries = role_queries or ROLE_QUERIES
 
@@ -505,33 +529,49 @@ def collect_live_job_listings(
     )
     completed_steps = 0
 
-    for role in active_role_queries:
-        for source_name, fetcher in api_fetchers:
-            status_message = f"Fetching {source_name}: {role}"
-            try:
-                all_jobs.extend(fetcher(role))
-            except Exception as exc:
-                print(f"Warning: failed to fetch from {source_name} for '{role}': {exc}")
-            finally:
-                completed_steps += 1
-                if progress_callback:
-                    progress_callback(completed_steps, total_steps, status_message)
+    api_workers = max(1, max_api_workers)
+    browser_workers = max(1, max_browser_workers)
+    total_workers = api_workers + browser_workers
+    browser_semaphore = threading.Semaphore(browser_workers)
 
-    for role in active_role_queries:
-        for location in LOCATION_QUERIES:
-            for source_name, fetcher in fetchers:
-                status_message = f"Fetching {source_name}: {role} in {location}"
-                try:
-                    all_jobs.extend(fetcher(role, location))
-                except Exception as exc:
+    def _run_browser_fetch(fetcher: Callable[[str, str], List[JobListing]], role: str, location: str) -> List[JobListing]:
+        # Constrain concurrent Selenium instances while still sharing the global task pool.
+        with browser_semaphore:
+            return fetcher(role, location)
+
+    # Run API and browser jobs together to reduce total wall-clock time.
+    with ThreadPoolExecutor(max_workers=total_workers) as executor:
+        future_map = {}
+
+        for role in active_role_queries:
+            for source_name, fetcher in api_fetchers:
+                status_message = f"Fetching {source_name}: {role}"
+                future = executor.submit(fetcher, role)
+                future_map[future] = (status_message, source_name, role, None)
+
+        for role in active_role_queries:
+            for location in LOCATION_QUERIES:
+                for source_name, fetcher in fetchers:
+                    status_message = f"Fetching {source_name}: {role} in {location}"
+                    future = executor.submit(_run_browser_fetch, fetcher, role, location)
+                    future_map[future] = (status_message, source_name, role, location)
+
+        for future in as_completed(future_map):
+            status_message, source_name, role, location = future_map[future]
+            try:
+                all_jobs.extend(future.result())
+            except Exception as exc:
+                if location is None:
+                    print(f"Warning: failed to fetch from {source_name} for '{role}': {exc}")
+                else:
                     # Continue on source/query errors so one failure doesn't break the full report.
                     print(
                         f"Warning: failed to fetch from {source_name} for '{role}' in '{location}': {exc}"
                     )
-                finally:
-                    completed_steps += 1
-                    if progress_callback:
-                        progress_callback(completed_steps, total_steps, status_message)
+            finally:
+                completed_steps += 1
+                if progress_callback:
+                    progress_callback(completed_steps, total_steps, status_message)
 
     return _deduplicate_jobs(all_jobs)
 
@@ -742,6 +782,8 @@ def run_pipeline(
     generate_pdf: bool = True,
     allow_mock_fallback: bool = True,
     progress_callback: Callable[[int, int, str], None] | None = None,
+    max_api_workers: int = 6,
+    max_browser_workers: int = 3,
 ) -> dict:
     """Run fetching, filtering, and PDF generation and return run metadata."""
     fetched_at = datetime.now()
@@ -757,6 +799,8 @@ def run_pipeline(
         all_jobs = collect_live_job_listings(
             role_queries=active_role_queries,
             progress_callback=progress_callback,
+            max_api_workers=max_api_workers,
+            max_browser_workers=max_browser_workers,
         )
 
     if not all_jobs and allow_mock_fallback:
@@ -808,6 +852,18 @@ def main() -> None:
         default=[ALL_ROLES_OPTION],
         help="Role filters to apply. Use 'All roles' to fetch everything configured.",
     )
+    parser.add_argument(
+        "--api-workers",
+        type=int,
+        default=6,
+        help="Parallel workers for API-based job sources.",
+    )
+    parser.add_argument(
+        "--browser-workers",
+        type=int,
+        default=3,
+        help="Parallel workers for browser-based scraping sources.",
+    )
     args = parser.parse_args()
 
     selected_roles = ROLE_QUERIES if ALL_ROLES_OPTION in args.roles else args.roles
@@ -816,6 +872,8 @@ def main() -> None:
         use_mock=args.mock,
         experience_level=args.experience,
         role_queries=selected_roles,
+        max_api_workers=args.api_workers,
+        max_browser_workers=args.browser_workers,
     )
     print(f"PDF generated successfully: {result['output_file']}")
     print(f"Job data fetched on: {result['fetched_at'].strftime('%Y-%m-%d %H:%M:%S')}")
