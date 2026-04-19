@@ -236,7 +236,7 @@ st.markdown(
     <div class="hero">
         <h1 style="margin:0;">Daily Job Opportunities</h1>
         <p>
-            Fetch fresh jobs with live progress and filter by role and experience.
+            Fetch fresh jobs from Naukri, Linkedin and Indeed with live progress and filter by role and experience.
             Results appear below with links and fetch time.
         </p>
     </div>
